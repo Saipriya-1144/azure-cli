@@ -2124,12 +2124,16 @@ class TestKuduDeploymentProgressMocked(unittest.TestCase):
         return response
 
     @staticmethod
-    def _params(is_linux=True, is_functionapp=False):
+    def _params(is_linux=True, is_functionapp=False, track_status=True, src_url=None):
         from azure.cli.command_modules.appservice.custom import OneDeployParams
         params = OneDeployParams()
         params.cmd = _get_test_cmd()
         params.resource_group_name = 'myRG'
         params.webapp_name = 'myApp'
+        params.src_path = None if src_url else 'app.zip'
+        params.src_url = src_url
+        params.artifact_type = 'zip'
+        params.track_status = track_status
         params.is_linux_webapp = is_linux
         params.is_functionapp = is_functionapp
         params._cached_scm_headers = {  # pylint: disable=protected-access
@@ -2142,6 +2146,21 @@ class TestKuduDeploymentProgressMocked(unittest.TestCase):
     def _rendered_warnings(logger_mock):
         return [call.args[0] % call.args[1:] for call in logger_mock.warning.call_args_list]
 
+    @staticmethod
+    def _styled_output(print_styled_text_mock):
+        output = []
+        for styled_call in print_styled_text_mock.call_args_list:
+            parts = styled_call.args[0]
+            if isinstance(parts, tuple) and len(parts) == 2 and hasattr(parts[0], 'value'):
+                parts = [parts]
+            output.append({
+                'text': ''.join(part[1] for part in parts),
+                'styles': [part[0].value for part in parts],
+                'file': styled_call.kwargs.get('file'),
+            })
+        return output
+
+    @mock.patch('azure.cli.command_modules.appservice.custom.print_styled_text')
     @mock.patch('azure.cli.command_modules.appservice.custom._log_webapp_troubleshoot_status_tip')
     @mock.patch('azure.cli.command_modules.appservice.custom.time.sleep')
     @mock.patch('azure.cli.command_modules.appservice.custom.time.time', return_value=0)
@@ -2149,7 +2168,8 @@ class TestKuduDeploymentProgressMocked(unittest.TestCase):
     @mock.patch('requests.get')
     @mock.patch('azure.cli.command_modules.appservice.custom.logger')
     def test_runtime_poll_renders_deduplicates_transitions_and_details(
-            self, logger_mock, requests_get_mock, send_raw_mock, _time_mock, _sleep_mock, _tip_mock):
+            self, logger_mock, requests_get_mock, send_raw_mock, _time_mock, _sleep_mock, tip_mock,
+            print_styled_text_mock):
         from azure.cli.command_modules.appservice.custom import (
             _KUDU_DEPLOYMENT_PROGRESS_REQUEST_TIMEOUT,
             _poll_deployment_runtime_status)
@@ -2198,14 +2218,25 @@ class TestKuduDeploymentProgressMocked(unittest.TestCase):
         requests_get_mock.side_effect = [
             self._response(payload=base_progress),
             self._response(payload=details),
-            self._response(payload=base_progress),
-            self._response(payload=details),
             self._response(payload=completed_progress),
             self._response(payload=details),
+            self._response(payload=completed_progress),
+            self._response(payload=completed_progress),
         ]
         send_raw_mock.side_effect = [
             self._response(payload={'properties': {'status': 'BuildInProgress'}}),
-            self._response(payload={'properties': {'status': 'BuildInProgress'}}),
+            self._response(payload={
+                'properties': {
+                    'status': 'RuntimeStarting',
+                    'numberOfInstancesInProgress': 1,
+                    'numberOfInstancesSuccessful': 0,
+                }}),
+            self._response(payload={
+                'properties': {
+                    'status': 'RuntimeStarting',
+                    'numberOfInstancesInProgress': 1,
+                    'numberOfInstancesSuccessful': 0,
+                }}),
             self._response(payload={'properties': {'status': 'RuntimeSuccessful'}}),
         ]
         params = self._params()
@@ -2216,28 +2247,45 @@ class TestKuduDeploymentProgressMocked(unittest.TestCase):
             deploy_params=params, progress_url=progress_url)
 
         self.assertEqual(result['properties']['status'], 'RuntimeSuccessful')
-        progress_calls = requests_get_mock.call_args_list[::2]
-        self.assertEqual([call.args[0] for call in progress_calls], [progress_url] * 3)
+        progress_calls = [
+            request_call for request_call in requests_get_mock.call_args_list
+            if request_call.args[0] == progress_url
+        ]
+        self.assertEqual(len(progress_calls), 4)
         for request_call in requests_get_mock.call_args_list:
             self.assertIs(request_call.kwargs['headers']['Authorization'], mock.sentinel.authorization)
             self.assertEqual(
                 request_call.kwargs['timeout'],
                 _KUDU_DEPLOYMENT_PROGRESS_REQUEST_TIMEOUT)
-        rendered = self._rendered_warnings(logger_mock)
+        rendered = self._styled_output(print_styled_text_mock)
         self.assertEqual(
-            [message for message in rendered if message.startswith('[') or message.startswith('      ')],
+            [item['text'] for item in rendered],
             [
-                '[1/2] Validating - Succeeded',
-                '[2/2] Building - In progress',
+                '\nDeployment progress',
+                '  ✓ [1/2] Validating (1s)',
+                '  ● [2/2] Building',
                 '      Restoring dependencies.',
-                '[2/2] Building - Succeeded',
+                '  ✓ [2/2] Building (9s)',
+                '\nStarting application',
+                '  ● Starting site',
+                '  ✓ Site started successfully (0s)',
             ])
-        self.assertNotIn('Unsafe arbitrary\ndeployment content.', rendered)
+        self.assertEqual(
+            [item['styles'] for item in rendered],
+            [['highlight'], ['success'], ['highlight'], ['secondary'],
+             ['success'], ['highlight'], ['highlight'], ['success']])
+        self.assertTrue(all(item['file'] is sys.stderr for item in rendered))
+        self.assertFalse(any('Unsafe arbitrary\ndeployment content.' in item['text'] for item in rendered))
+        self.assertFalse(any(
+            call.args and call.args[0].startswith('Status:')
+            for call in logger_mock.warning.call_args_list))
+        tip_mock.assert_not_called()
 
+    @mock.patch('azure.cli.command_modules.appservice.custom.print_styled_text')
     @mock.patch('requests.get')
     @mock.patch('azure.cli.command_modules.appservice.custom.logger')
     def test_progress_details_accept_contract_messages_and_reject_unsafe_content(
-            self, logger_mock, requests_get_mock):
+            self, logger_mock, requests_get_mock, print_styled_text_mock):
         from azure.cli.command_modules.appservice.custom import (
             _KUDU_DEPLOYMENT_PROGRESS_DETAIL_MAX_LENGTH,
             _KUDU_DEPLOYMENT_PROGRESS_REQUEST_TIMEOUT,
@@ -2289,8 +2337,8 @@ class TestKuduDeploymentProgressMocked(unittest.TestCase):
         _try_show_kudu_deployment_progress(params.cmd, params, progress_url)
 
         rendered_details = [
-            message for message in self._rendered_warnings(logger_mock)
-            if message.startswith('      ')
+            item['text'] for item in self._styled_output(print_styled_text_mock)
+            if item['text'].startswith('      ')
         ]
         self.assertEqual(
             rendered_details,
@@ -2301,6 +2349,345 @@ class TestKuduDeploymentProgressMocked(unittest.TestCase):
             self.assertEqual(
                 request_call.kwargs['timeout'],
                 _KUDU_DEPLOYMENT_PROGRESS_REQUEST_TIMEOUT)
+
+    def test_polished_full_success_order_and_return_payload(self):
+        from azure.cli.command_modules.appservice.custom import (
+            _perform_onedeploy_internal,
+            _show_polished_preparation_status,
+            _show_polished_runtime_status,
+            _try_show_kudu_deployment_progress,
+        )
+
+        progress_url = 'https://myapp.scm.azurewebsites.net/api/deployments/deploy-1/progress'
+        details_url = progress_url + '/2'
+        in_progress = {
+            'status': 'in_progress',
+            'total_steps': 2,
+            'steps': ['Validating', 'Building'],
+            'progress': [
+                {
+                    'step_number': 1,
+                    'stage': 'Validating',
+                    'status': 'succeeded',
+                    'started_at': '2026-10-06T08:00:00Z',
+                    'completed_at': '2026-10-06T08:00:01Z',
+                    'details_url': None,
+                },
+                {
+                    'step_number': 2,
+                    'stage': 'Building',
+                    'status': 'in_progress',
+                    'started_at': '2026-10-06T08:00:01Z',
+                    'completed_at': None,
+                    'details_url': details_url,
+                },
+            ],
+        }
+        succeeded = {
+            **in_progress,
+            'status': 'succeeded',
+            'progress': [
+                in_progress['progress'][0],
+                {
+                    **in_progress['progress'][1],
+                    'status': 'succeeded',
+                    'completed_at': '2026-10-06T08:01:09Z',
+                },
+            ],
+        }
+        first_details = [
+            {'id': 'detail-1', 'message': 'Restoring dependencies.'},
+        ]
+        final_details = first_details + [
+            {'id': 'detail-2', 'message': 'Preparing build output.'},
+            {'id': 'detail-3', 'message': 'Writing the build manifest.'},
+        ]
+        response_body = {'properties': {'status': 'RuntimeSuccessful'}, 'unchanged': True}
+        params = self._params()
+        params.src_path = 'node-oryx-small.zip'
+        params.artifact_type = None
+        params.enable_kudu_warmup = True
+        params.enriched_errors = False
+        params.show_secure_build = False
+        params.slot = None
+        params.timeout = None
+
+        def _warmup(_params):
+            _show_polished_preparation_status(_params, 'Kudu warmed up', completed=True)
+            return {'ARRAffinity': 'instance-1'}
+
+        def _poll_status(*_args, **_kwargs):
+            self.assertTrue(_try_show_kudu_deployment_progress(
+                params.cmd, params, progress_url))
+            self.assertTrue(_try_show_kudu_deployment_progress(
+                params.cmd, params, progress_url))
+            self.assertTrue(_show_polished_runtime_status(params, 'RuntimeStarting'))
+            self.assertTrue(_show_polished_runtime_status(params, 'RuntimeSuccessful'))
+            return response_body
+
+        post_response = mock.MagicMock(status_code=202)
+        with mock.patch(
+                'azure.cli.command_modules.appservice.custom._get_onedeploy_request_body',
+                return_value=(b'package', None)), \
+                mock.patch(
+                    'azure.cli.command_modules.appservice.custom._build_onedeploy_url',
+                    return_value='https://myapp.scm.azurewebsites.net/api/publish?type=zip'), \
+                mock.patch(
+                    'azure.cli.command_modules.appservice.custom._get_onedeploy_status_url',
+                    return_value='https://myapp.scm.azurewebsites.net/api/deployments/latest'), \
+                mock.patch(
+                    'azure.cli.command_modules.appservice.custom._get_ondeploy_headers',
+                    return_value={'Authorization': mock.sentinel.authorization}), \
+                mock.patch(
+                    'azure.cli.command_modules.appservice.custom._warmup_kudu_and_get_cookie_internal',
+                    side_effect=_warmup), \
+                mock.patch(
+                    'azure.cli.command_modules.appservice.custom._check_runtimestatus_with_deploymentstatusapi',
+                    side_effect=_poll_status), \
+                mock.patch(
+                    'azure.cli.command_modules.appservice.custom._get_visit_url',
+                    return_value='http://myapp.azurewebsites.net'), \
+                mock.patch(
+                    'azure.cli.command_modules.appservice.custom._log_webapp_troubleshoot_status_tip') as tip_mock, \
+                mock.patch(
+                    'azure.cli.command_modules.appservice.custom.print_styled_text') as print_styled_text_mock, \
+                mock.patch(
+                    'azure.cli.command_modules.appservice.custom.logger') as logger_mock, \
+                mock.patch(
+                    'azure.cli.command_modules.appservice.custom.time.time',
+                    side_effect=[0, 69, 90, 90]), \
+                mock.patch(
+                    'requests.post', return_value=post_response), \
+                mock.patch(
+                    'requests.get',
+                    side_effect=[
+                        self._response(payload=in_progress),
+                        self._response(payload=first_details),
+                        self._response(payload=succeeded),
+                        self._response(payload=final_details),
+                    ]):
+            result = _perform_onedeploy_internal(params)
+
+        self.assertIs(result, response_body)
+        rendered = self._styled_output(print_styled_text_mock)
+        self.assertEqual(
+            [item['text'] for item in rendered],
+            [
+                'Deploying node-oryx-small.zip\n\n'
+                '  App:             myApp\n'
+                '  Resource group:  myRG\n'
+                '  Deployment type: zip\n'
+                '  Status tracking: Enabled\n\n'
+                'Preparing deployment',
+                '  ● Warming up Kudu',
+                '  ✓ Kudu warmed up',
+                '  ✓ Deployment request accepted',
+                '\nDeployment progress',
+                '  ✓ [1/2] Validating (1s)',
+                '  ● [2/2] Building',
+                '      Restoring dependencies.',
+                '      Preparing build output.',
+                '      Writing the build manifest.',
+                '  ✓ [2/2] Building (1m 8s)',
+                '\nStarting application',
+                '  ● Starting site',
+                '  ✓ Site started successfully (21s)',
+                '\n✓ Deployment completed successfully in 1m 30s\n\n'
+                '  App: http://myapp.azurewebsites.net',
+            ])
+        self.assertEqual(
+            rendered[0]['styles'],
+            ['highlight', 'primary', 'highlight'])
+        self.assertEqual(
+            rendered[-1]['styles'],
+            ['success', 'primary', 'hyperlink'])
+        self.assertTrue(all(item['file'] is sys.stderr for item in rendered))
+        tip_mock.assert_not_called()
+        old_messages = (
+            'Initiating deployment',
+            'Deploying from local path:',
+            'Warming up Kudu before deployment.',
+            'Warmed up Kudu instance successfully.',
+            'Polling the status of',
+            'Deployment has completed successfully',
+            'You can visit your app at:',
+        )
+        rendered_warnings = self._rendered_warnings(logger_mock)
+        for old_message in old_messages:
+            self.assertFalse(any(old_message in warning for warning in rendered_warnings))
+
+    @mock.patch('azure.cli.command_modules.appservice.custom.print_styled_text')
+    @mock.patch('requests.get')
+    def test_progress_details_collapse_counter_snapshots(
+            self, requests_get_mock, print_styled_text_mock):
+        from azure.cli.command_modules.appservice.custom import _try_show_kudu_deployment_progress
+
+        progress_url = 'https://myapp.scm.azurewebsites.net/api/deployments/deploy-1/progress'
+        details_url = progress_url + '/1'
+        requests_get_mock.side_effect = [
+            self._response(payload={
+                'status': 'in_progress',
+                'total_steps': 1,
+                'steps': ['Extracting to local directory'],
+                'progress': [{
+                    'step_number': 1,
+                    'stage': 'Extracting to local directory',
+                    'status': 'in_progress',
+                    'started_at': '2026-10-06T08:00:00Z',
+                    'completed_at': None,
+                    'details_url': details_url,
+                }],
+            }),
+            self._response(payload=[
+                {'id': 'extract-1', 'message': 'Extracted 1 of 2 entries (300 bytes)'},
+                {'id': 'fixed', 'message': 'Checking archive.'},
+                {'id': 'extract-2', 'message': 'Extracted 2 entries (755 bytes)'},
+                {'id': 'copy-1', 'message': 'Copied 1 files, 100 bytes'},
+                {'id': 'copy-2', 'message': 'Copied 2 files, 200 bytes'},
+                {'id': 'sync-1', 'message': 'Synced 25 files'},
+                {'id': 'sync-2', 'message': 'Synced 100 files, 1 MB at 2 MB/s'},
+            ]),
+        ]
+        params = self._params()
+
+        self.assertTrue(_try_show_kudu_deployment_progress(
+            params.cmd, params, progress_url))
+
+        self.assertEqual(
+            [item['text'] for item in self._styled_output(print_styled_text_mock)
+             if item['text'].startswith('      ')],
+            [
+                '      Checking archive.',
+                '      Extracted 2 entries (755 bytes)',
+                '      Copied 2 files, 200 bytes',
+                '      Synced 100 files, 1 MB at 2 MB/s',
+            ])
+
+    def test_duration_formatting_and_timestamp_failures(self):
+        from azure.cli.command_modules.appservice.custom import (
+            _format_onedeploy_duration,
+            _get_kudu_deployment_progress_elapsed,
+        )
+
+        self.assertEqual(_format_onedeploy_duration(8), '8s')
+        self.assertEqual(_format_onedeploy_duration(68), '1m 8s')
+        self.assertEqual(_format_onedeploy_duration(3720), '1h 2m')
+        self.assertIsNone(_format_onedeploy_duration(-1))
+        self.assertEqual(
+            _get_kudu_deployment_progress_elapsed({
+                'started_at': '2026-10-06T08:00:01Z',
+                'completed_at': '2026-10-06T08:01:09Z',
+            }),
+            '1m 8s')
+        for invalid_entry in (
+                {'started_at': None, 'completed_at': None},
+                {'started_at': 'not-a-date', 'completed_at': '2026-10-06T08:01:09Z'},
+                {'started_at': '2026-10-06T08:00:01', 'completed_at': '2026-10-06T08:01:09'},
+                {'started_at': '2026-10-06T08:01:09Z', 'completed_at': '2026-10-06T08:00:01Z'}):
+            with self.subTest(invalid_entry=invalid_entry):
+                self.assertIsNone(_get_kudu_deployment_progress_elapsed(invalid_entry))
+
+    @mock.patch('azure.cli.command_modules.appservice.custom.print_styled_text')
+    @mock.patch('requests.get')
+    def test_progress_gating_skips_optional_requests_for_ineligible_flows(
+            self, requests_get_mock, print_styled_text_mock):
+        from azure.cli.command_modules.appservice.custom import _try_show_kudu_deployment_progress
+
+        progress_url = 'https://myapp.scm.azurewebsites.net/api/deployments/deploy-1/progress'
+        params_variants = (
+            self._params(is_linux=False),
+            self._params(is_functionapp=True),
+            self._params(track_status=False),
+            self._params(src_url='https://example.com/app.zip'),
+        )
+        for params in params_variants:
+            with self.subTest(
+                    is_linux=params.is_linux_webapp,
+                    is_functionapp=params.is_functionapp,
+                    track_status=params.track_status,
+                    src_url=params.src_url):
+                self.assertFalse(_try_show_kudu_deployment_progress(
+                    params.cmd, params, progress_url))
+
+        requests_get_mock.assert_not_called()
+        print_styled_text_mock.assert_not_called()
+
+    @mock.patch('azure.cli.command_modules.appservice.custom._log_webapp_troubleshoot_status_tip')
+    @mock.patch('azure.cli.command_modules.appservice.custom.time.sleep')
+    @mock.patch('azure.cli.command_modules.appservice.custom.send_raw_request')
+    @mock.patch('requests.get')
+    @mock.patch('azure.cli.command_modules.appservice.custom.print_styled_text')
+    @mock.patch('azure.cli.command_modules.appservice.custom.logger')
+    def test_runtime_poll_preserves_generic_status_when_progress_is_unavailable(
+            self, logger_mock, print_styled_text_mock, requests_get_mock,
+            send_raw_mock, _sleep_mock, tip_mock):
+        from azure.cli.command_modules.appservice.custom import _poll_deployment_runtime_status
+
+        progress_url = 'https://myapp.scm.azurewebsites.net/api/deployments/deploy-1/progress'
+        for malformed_progress in (None, ['unexpected']):
+            with self.subTest(malformed_progress=malformed_progress):
+                logger_mock.reset_mock()
+                print_styled_text_mock.reset_mock()
+                requests_get_mock.reset_mock()
+                send_raw_mock.reset_mock()
+                tip_mock.reset_mock()
+                send_raw_mock.side_effect = [
+                    self._response(payload={'properties': {'status': 'BuildInProgress'}}),
+                    self._response(payload={'properties': {'status': 'RuntimeSuccessful'}}),
+                ]
+                if malformed_progress is None:
+                    current_progress_url = None
+                else:
+                    current_progress_url = progress_url
+                    requests_get_mock.return_value = self._response(payload=malformed_progress)
+
+                with mock.patch(
+                        'azure.cli.command_modules.appservice.custom.time.time',
+                        return_value=0):
+                    result = _poll_deployment_runtime_status(
+                        self._params().cmd, 'myRG', 'myApp', None,
+                        'https://management.azure.com/deploymentstatus', 'deploy-1',
+                        deploy_params=self._params(), progress_url=current_progress_url)
+
+                self.assertEqual(result['properties']['status'], 'RuntimeSuccessful')
+                logger_mock.warning.assert_any_call(
+                    'Status: %s Time: %s(s)', 'Building the app...', 0)
+                logger_mock.warning.assert_any_call(
+                    'Status: %s Time: %s(s)', 'Site started successfully.', 0)
+                print_styled_text_mock.assert_not_called()
+                tip_mock.assert_called_once_with('myApp', 'myRG', True)
+                if malformed_progress is None:
+                    requests_get_mock.assert_not_called()
+                else:
+                    self.assertEqual(requests_get_mock.call_count, 2)
+
+    @mock.patch('azure.cli.command_modules.appservice.custom.print_styled_text',
+                side_effect=RuntimeError('style failure'))
+    @mock.patch('requests.get')
+    def test_styled_render_failure_is_non_fatal(
+            self, requests_get_mock, print_styled_text_mock):
+        from azure.cli.command_modules.appservice.custom import _try_show_kudu_deployment_progress
+
+        progress_url = 'https://myapp.scm.azurewebsites.net/api/deployments/deploy-1/progress'
+        requests_get_mock.return_value = self._response(payload={
+            'status': 'in_progress',
+            'total_steps': 1,
+            'steps': ['Building'],
+            'progress': [{
+                'step_number': 1,
+                'stage': 'Building',
+                'status': 'in_progress',
+                'started_at': '2026-10-06T08:00:00Z',
+                'completed_at': None,
+                'details_url': None,
+            }],
+        })
+        params = self._params()
+
+        self.assertFalse(_try_show_kudu_deployment_progress(
+            params.cmd, params, progress_url))
+        self.assertFalse(params._kudu_progress_state['structured_progress_active'])
+        print_styled_text_mock.assert_called_once()
 
     @mock.patch('azure.cli.command_modules.appservice.custom._poll_deployment_runtime_status')
     @mock.patch('azure.cli.command_modules.appservice.custom._build_deploymentstatus_url',
@@ -2362,11 +2749,12 @@ class TestKuduDeploymentProgressMocked(unittest.TestCase):
 
         self.assertEqual(deployment_info, (None, None))
 
+    @mock.patch('azure.cli.command_modules.appservice.custom.print_styled_text')
     @mock.patch('azure.cli.command_modules.appservice.custom.time.sleep')
     @mock.patch('requests.get')
     @mock.patch('azure.cli.command_modules.appservice.custom.logger')
     def test_direct_kudu_fallback_uses_returned_progress_url(
-            self, logger_mock, requests_get_mock, _sleep_mock):
+            self, logger_mock, requests_get_mock, _sleep_mock, print_styled_text_mock):
         from azure.cli.command_modules.appservice.custom import (
             _KUDU_DEPLOYMENT_PROGRESS_REQUEST_TIMEOUT,
             _check_zip_deployment_status)
@@ -2400,13 +2788,16 @@ class TestKuduDeploymentProgressMocked(unittest.TestCase):
         self.assertEqual(
             requests_get_mock.call_args_list[1].kwargs['timeout'],
             _KUDU_DEPLOYMENT_PROGRESS_REQUEST_TIMEOUT)
-        self.assertIn('[1/1] Deploying - Succeeded', self._rendered_warnings(logger_mock))
+        self.assertEqual(
+            [item['text'] for item in self._styled_output(print_styled_text_mock)],
+            ['\nDeployment progress', '  ✓ [1/1] Deploying (10s)'])
 
+    @mock.patch('azure.cli.command_modules.appservice.custom.print_styled_text')
     @mock.patch('azure.cli.command_modules.appservice.custom.time.sleep')
     @mock.patch('requests.get')
     @mock.patch('azure.cli.command_modules.appservice.custom.logger')
     def test_direct_kudu_fallback_skips_absent_progress_url(
-            self, logger_mock, requests_get_mock, _sleep_mock):
+            self, logger_mock, requests_get_mock, _sleep_mock, print_styled_text_mock):
         from azure.cli.command_modules.appservice.custom import _check_zip_deployment_status
         requests_get_mock.return_value = self._response(payload={'status': 4})
         params = self._params()
@@ -2418,13 +2809,14 @@ class TestKuduDeploymentProgressMocked(unittest.TestCase):
 
         self.assertEqual(result['status'], 4)
         requests_get_mock.assert_called_once()
-        self.assertFalse(any(message.startswith('[') for message in self._rendered_warnings(logger_mock)))
+        print_styled_text_mock.assert_not_called()
 
+    @mock.patch('azure.cli.command_modules.appservice.custom.print_styled_text')
     @mock.patch('azure.cli.command_modules.appservice.custom.time.sleep')
     @mock.patch('requests.get')
     @mock.patch('azure.cli.command_modules.appservice.custom.logger')
     def test_direct_kudu_fallback_skips_windows_and_function_apps(
-            self, logger_mock, requests_get_mock, _sleep_mock):
+            self, logger_mock, requests_get_mock, _sleep_mock, print_styled_text_mock):
         from azure.cli.command_modules.appservice.custom import _check_zip_deployment_status
         progress_url = 'https://myapp.scm.azurewebsites.net/api/deployments/deploy-1/progress'
 
@@ -2443,13 +2835,14 @@ class TestKuduDeploymentProgressMocked(unittest.TestCase):
 
                 self.assertEqual(result['status'], 4)
                 requests_get_mock.assert_called_once()
-                self.assertFalse(any(message.startswith('[') for message in self._rendered_warnings(logger_mock)))
+                print_styled_text_mock.assert_not_called()
 
+    @mock.patch('azure.cli.command_modules.appservice.custom.print_styled_text')
     @mock.patch('azure.cli.command_modules.appservice.custom.time.sleep')
     @mock.patch('requests.get')
     @mock.patch('azure.cli.command_modules.appservice.custom.logger')
     def test_progress_request_failures_are_non_fatal(
-            self, logger_mock, requests_get_mock, _sleep_mock):
+            self, logger_mock, requests_get_mock, _sleep_mock, print_styled_text_mock):
         from requests.exceptions import Timeout
         from azure.cli.command_modules.appservice.custom import _check_zip_deployment_status
         progress_url = 'https://myapp.scm.azurewebsites.net/api/deployments/deploy-1/progress'
@@ -2479,11 +2872,13 @@ class TestKuduDeploymentProgressMocked(unittest.TestCase):
 
                 self.assertEqual(result['status'], 4)
                 self.assertEqual(requests_get_mock.call_count, 2)
-                self.assertFalse(any(message.startswith('[') for message in self._rendered_warnings(logger_mock)))
+                print_styled_text_mock.assert_not_called()
 
+    @mock.patch('azure.cli.command_modules.appservice.custom.print_styled_text')
     @mock.patch('requests.get')
     @mock.patch('azure.cli.command_modules.appservice.custom.logger')
-    def test_progress_detail_failures_are_non_fatal(self, logger_mock, requests_get_mock):
+    def test_progress_detail_failures_are_non_fatal(
+            self, logger_mock, requests_get_mock, print_styled_text_mock):
         from requests.exceptions import Timeout
         from azure.cli.command_modules.appservice.custom import (
             _KUDU_DEPLOYMENT_PROGRESS_REQUEST_TIMEOUT,
@@ -2514,6 +2909,7 @@ class TestKuduDeploymentProgressMocked(unittest.TestCase):
             with self.subTest(detail_failure=type(detail_failure).__name__):
                 requests_get_mock.reset_mock()
                 logger_mock.reset_mock()
+                print_styled_text_mock.reset_mock()
                 requests_get_mock.side_effect = [
                     self._response(payload=progress),
                     detail_failure,
@@ -2526,7 +2922,9 @@ class TestKuduDeploymentProgressMocked(unittest.TestCase):
                 self.assertEqual(
                     requests_get_mock.call_args_list[1].kwargs['timeout'],
                     _KUDU_DEPLOYMENT_PROGRESS_REQUEST_TIMEOUT)
-                self.assertIn('[1/1] Building - In progress', self._rendered_warnings(logger_mock))
+                self.assertEqual(
+                    [item['text'] for item in self._styled_output(print_styled_text_mock)],
+                    ['\nDeployment progress', '  ● [1/1] Building'])
 
 
 class TestRuntimeFailedHintMocked(unittest.TestCase):

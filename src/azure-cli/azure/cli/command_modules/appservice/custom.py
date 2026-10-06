@@ -11102,12 +11102,24 @@ _KUDU_DEPLOYMENT_PROGRESS_STATUSES = {
 
 _KUDU_DEPLOYMENT_PROGRESS_REQUEST_TIMEOUT = 5
 _KUDU_DEPLOYMENT_PROGRESS_DETAIL_MAX_LENGTH = 512
+_KUDU_DEPLOYMENT_PROGRESS_TERMINAL_STATUSES = {'succeeded', 'failed', 'canceled'}
+_KUDU_DEPLOYMENT_PROGRESS_COUNTER_PATTERNS = (
+    ('extracted', re.compile(
+        r'^Extracted (?:\d+ of \d+(?: entries)?|\d+ entries)(?: \([^)]+\))?\.?$')),
+    ('copied', re.compile(
+        r'^Copied (?:\d+ of \d+|\d+) files(?:, [^,\r\n]+)?\.?$')),
+    ('synced', re.compile(
+        r'^Synced \d+ files(?:, [^,\r\n]+ at [^,\r\n]+/s)?\.?$')),
+)
 
 
 def _should_show_kudu_deployment_progress(deploy_params):
     return deploy_params is not None and \
         deploy_params.is_linux_webapp is True and \
-        deploy_params.is_functionapp is False
+        deploy_params.is_functionapp is False and \
+        bool(deploy_params.src_path) and \
+        not deploy_params.src_url and \
+        bool(deploy_params.track_status)
 
 
 def _get_kudu_deployment_progress_state(deploy_params):
@@ -11117,9 +11129,63 @@ def _get_kudu_deployment_progress_state(deploy_params):
             'step_statuses': {},
             'detail_ids': set(),
             'detail_messages': set(),
+            'structured_progress_active': False,
+            'progress_heading_emitted': False,
+            'runtime_heading_emitted': False,
+            'runtime_starting_emitted': False,
+            'runtime_success_emitted': False,
+            'runtime_started_at': None,
+            'deployment_started_at': None,
+            'polished_preamble_rendered': False,
         }
         deploy_params._kudu_progress_state = state  # pylint: disable=protected-access
     return state
+
+
+def _try_print_onedeploy_styled_text(parts):
+    try:
+        print_styled_text(parts, file=sys.stderr)
+        return True
+    except Exception:  # pylint: disable=broad-except
+        logger.debug("Styled deployment progress output is unavailable.")
+        return False
+
+
+def _uses_polished_onedeploy_preparation(deploy_params):
+    if not _should_show_kudu_deployment_progress(deploy_params):
+        return False
+    state = _get_kudu_deployment_progress_state(deploy_params)
+    return state['polished_preamble_rendered']
+
+
+def _show_polished_onedeploy_preamble(deploy_params):
+    import os
+
+    if not _should_show_kudu_deployment_progress(deploy_params):
+        return False
+    package_name = os.path.basename(deploy_params.src_path)
+    rendered = _try_print_onedeploy_styled_text([
+        (Style.HIGHLIGHT, 'Deploying {}'.format(package_name)),
+        (Style.PRIMARY, '\n\n  App:             {}\n'
+                        '  Resource group:  {}\n'
+                        '  Deployment type: {}\n'
+                        '  Status tracking: Enabled'.format(
+                            deploy_params.webapp_name,
+                            deploy_params.resource_group_name,
+                            deploy_params.artifact_type)),
+        (Style.HIGHLIGHT, '\n\nPreparing deployment'),
+    ])
+    if rendered:
+        _get_kudu_deployment_progress_state(deploy_params)['polished_preamble_rendered'] = True
+    return rendered
+
+
+def _show_polished_preparation_status(deploy_params, message, completed=False):
+    if not _uses_polished_onedeploy_preparation(deploy_params):
+        return False
+    marker = '✓' if completed else '●'
+    style = Style.SUCCESS if completed else Style.HIGHLIGHT
+    return _try_print_onedeploy_styled_text((style, '  {} {}'.format(marker, message)))
 
 
 def _get_cached_scm_headers_for_progress(cmd, deploy_params):
@@ -11135,14 +11201,15 @@ def _get_cached_scm_headers_for_progress(cmd, deploy_params):
 
 def _try_show_kudu_deployment_progress(cmd, deploy_params, progress_url, headers=None):
     if not _should_show_kudu_deployment_progress(deploy_params):
-        return
+        return False
+    state = _get_kudu_deployment_progress_state(deploy_params)
     try:
         progress_headers = headers or _get_cached_scm_headers_for_progress(cmd, deploy_params)
-        _show_kudu_deployment_progress(
-            progress_url, progress_headers,
-            _get_kudu_deployment_progress_state(deploy_params))
+        rendered = _show_kudu_deployment_progress(progress_url, progress_headers, state)
+        return rendered or state['structured_progress_active']
     except Exception:  # pylint: disable=broad-except
         logger.debug("Kudu deployment progress is unavailable.")
+        return state['structured_progress_active']
 
 
 def _show_kudu_deployment_progress(progress_url, headers, state):  # pylint: disable=too-many-return-statements
@@ -11150,7 +11217,7 @@ def _show_kudu_deployment_progress(progress_url, headers, state):  # pylint: dis
     from azure.cli.core.util import should_disable_connection_verify
 
     if not isinstance(progress_url, str) or not progress_url or not headers:
-        return
+        return False
 
     try:
         response = requests.get(progress_url, headers=headers,
@@ -11158,24 +11225,30 @@ def _show_kudu_deployment_progress(progress_url, headers, state):  # pylint: dis
                                 timeout=_KUDU_DEPLOYMENT_PROGRESS_REQUEST_TIMEOUT)
         if response.status_code != 200:
             logger.debug("Kudu deployment progress is unavailable.")
-            return
+            return False
         snapshot = response.json()
     except Exception:  # pylint: disable=broad-except
         logger.debug("Kudu deployment progress is unavailable.")
-        return
+        return False
 
     if not isinstance(snapshot, dict) or snapshot.get('status') not in _KUDU_DEPLOYMENT_PROGRESS_STATUSES:
-        return
+        return False
 
     total_steps = snapshot.get('total_steps')
     steps = snapshot.get('steps')
     progress = snapshot.get('progress')
     if isinstance(total_steps, bool) or not isinstance(total_steps, int) or total_steps <= 0:
-        return
+        return False
     if not isinstance(steps, list) or len(steps) != total_steps:
-        return
+        return False
     if not all(isinstance(stage, str) and stage for stage in steps) or not isinstance(progress, list):
-        return
+        return False
+
+    if not state['progress_heading_emitted']:
+        if not _try_print_onedeploy_styled_text((Style.HIGHLIGHT, '\nDeployment progress')):
+            return False
+        state['progress_heading_emitted'] = True
+    state['structured_progress_active'] = True
 
     for entry in progress:
         if not isinstance(entry, dict):
@@ -11190,15 +11263,31 @@ def _show_kudu_deployment_progress(progress_url, headers, state):  # pylint: dis
             continue
 
         step_key = (step_number, stage)
-        if state['step_statuses'].get(step_key) != status:
-            logger.warning("[%s/%s] %s - %s",
-                           step_number, total_steps, stage,
-                           _KUDU_DEPLOYMENT_PROGRESS_STATUSES[status])
-            state['step_statuses'][step_key] = status
-
         details_url = entry.get('details_url')
-        if isinstance(details_url, str) and details_url:
+        has_details = isinstance(details_url, str) and bool(details_url)
+        status_changed = state['step_statuses'].get(step_key) != status
+        if status in _KUDU_DEPLOYMENT_PROGRESS_TERMINAL_STATUSES and status_changed and has_details:
             _show_kudu_deployment_progress_details(details_url, headers, state)
+
+        if status_changed:
+            marker, style = {
+                'in_progress': ('●', Style.HIGHLIGHT),
+                'succeeded': ('✓', Style.SUCCESS),
+                'failed': ('✗', Style.ERROR),
+                'canceled': ('✗', Style.ERROR),
+            }[status]
+            elapsed = _get_kudu_deployment_progress_elapsed(entry)
+            elapsed_text = ' ({})'.format(elapsed) if elapsed else ''
+            if _try_print_onedeploy_styled_text((
+                    style,
+                    '  {} [{}/{}] {}{}'.format(
+                        marker, step_number, total_steps, stage, elapsed_text))):
+                state['step_statuses'][step_key] = status
+
+        if status == 'in_progress' and has_details:
+            _show_kudu_deployment_progress_details(details_url, headers, state)
+
+    return True
 
 
 def _show_kudu_deployment_progress_details(details_url, headers, state):
@@ -11219,19 +11308,30 @@ def _show_kudu_deployment_progress_details(details_url, headers, state):
 
     if not isinstance(entries, list):
         return
-    for entry in entries:
+    last_counter_indexes = {}
+    for index, entry in enumerate(entries):
+        if not isinstance(entry, dict):
+            continue
+        counter_family = _get_kudu_deployment_progress_counter_family(entry.get('message'))
+        if counter_family:
+            last_counter_indexes[counter_family] = index
+
+    for index, entry in enumerate(entries):
         if not isinstance(entry, dict):
             continue
         message = entry.get('message')
         if not _is_safe_kudu_deployment_progress_detail(message):
             continue
+        counter_family = _get_kudu_deployment_progress_counter_family(message)
+        if counter_family and last_counter_indexes[counter_family] != index:
+            continue
         detail_id = entry.get('id')
         identity = (details_url, detail_id) if isinstance(detail_id, (str, int)) else (details_url, message)
         if identity in state['detail_ids'] or message in state['detail_messages']:
             continue
-        logger.warning("      %s", message)
-        state['detail_ids'].add(identity)
-        state['detail_messages'].add(message)
+        if _try_print_onedeploy_styled_text((Style.SECONDARY, '      {}'.format(message))):
+            state['detail_ids'].add(identity)
+            state['detail_messages'].add(message)
 
 
 def _is_safe_kudu_deployment_progress_detail(message):
@@ -11239,6 +11339,101 @@ def _is_safe_kudu_deployment_progress_detail(message):
         bool(message.strip()) and \
         len(message) <= _KUDU_DEPLOYMENT_PROGRESS_DETAIL_MAX_LENGTH and \
         message.isprintable()
+
+
+def _get_kudu_deployment_progress_counter_family(message):
+    if not isinstance(message, str):
+        return None
+    for family, pattern in _KUDU_DEPLOYMENT_PROGRESS_COUNTER_PATTERNS:
+        if pattern.fullmatch(message):
+            return family
+    return None
+
+
+def _get_kudu_deployment_progress_elapsed(entry):
+    started_at = _parse_kudu_deployment_progress_timestamp(entry.get('started_at'))
+    completed_at = _parse_kudu_deployment_progress_timestamp(entry.get('completed_at'))
+    if started_at is None or completed_at is None or completed_at < started_at:
+        return None
+    return _format_onedeploy_duration((completed_at - started_at).total_seconds())
+
+
+def _parse_kudu_deployment_progress_timestamp(value):
+    if not isinstance(value, str) or not value.strip():
+        return None
+    value = value.strip()
+    if value.endswith('Z'):
+        value = value[:-1] + '+00:00'
+    try:
+        parsed = datetime.datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return None
+    return parsed.astimezone(datetime.timezone.utc)
+
+
+def _format_onedeploy_duration(total_seconds):
+    if isinstance(total_seconds, bool) or not isinstance(total_seconds, (int, float)) or total_seconds < 0:
+        return None
+    total_seconds = int(total_seconds)
+    if total_seconds >= 3600:
+        hours, remaining = divmod(total_seconds, 3600)
+        minutes = remaining // 60
+        return '{}h {}m'.format(hours, minutes) if minutes else '{}h'.format(hours)
+    if total_seconds >= 60:
+        minutes, seconds = divmod(total_seconds, 60)
+        return '{}m {}s'.format(minutes, seconds) if seconds else '{}m'.format(minutes)
+    return '{}s'.format(total_seconds)
+
+
+def _show_polished_runtime_status(deploy_params, deployment_status):
+    state = _get_kudu_deployment_progress_state(deploy_params)
+    if not state['structured_progress_active']:
+        return False
+
+    if deployment_status not in ('RuntimeStarting', 'RuntimeSuccessful'):
+        return True
+    if not state['runtime_heading_emitted']:
+        if not _try_print_onedeploy_styled_text((Style.HIGHLIGHT, '\nStarting application')):
+            return False
+        state['runtime_heading_emitted'] = True
+
+    if deployment_status == 'RuntimeStarting' and not state['runtime_starting_emitted']:
+        if not _try_print_onedeploy_styled_text((Style.HIGHLIGHT, '  ● Starting site')):
+            return False
+        state['runtime_starting_emitted'] = True
+        state['runtime_started_at'] = time.time()
+    elif deployment_status == 'RuntimeSuccessful' and not state['runtime_success_emitted']:
+        elapsed = None
+        if state['runtime_started_at'] is not None:
+            elapsed = _format_onedeploy_duration(time.time() - state['runtime_started_at'])
+        elapsed_text = ' ({})'.format(elapsed) if elapsed else ''
+        if not _try_print_onedeploy_styled_text((
+                Style.SUCCESS, '  ✓ Site started successfully{}'.format(elapsed_text))):
+            return False
+        state['runtime_success_emitted'] = True
+    return True
+
+
+def _show_polished_onedeploy_completion(deploy_params):
+    state = _get_kudu_deployment_progress_state(deploy_params)
+    if not state['structured_progress_active']:
+        return False
+    elapsed = None
+    if state['deployment_started_at'] is not None:
+        elapsed = _format_onedeploy_duration(time.time() - state['deployment_started_at'])
+    elapsed_text = ' in {}'.format(elapsed) if elapsed else ''
+    try:
+        app_url = _get_visit_url(deploy_params)
+    except Exception:  # pylint: disable=broad-except
+        logger.debug("Unable to build the styled deployment completion URL.")
+        return False
+    return _try_print_onedeploy_styled_text([
+        (Style.SUCCESS, '\n✓ Deployment completed successfully{}'.format(elapsed_text)),
+        (Style.PRIMARY, '\n\n  App: '),
+        (Style.HYPERLINK, app_url),
+    ])
 
 
 def _check_zip_deployment_status(cmd, rg_name, name, deployment_status_url, slot, timeout=None,
@@ -11358,9 +11553,10 @@ def _check_runtimestatus_with_deploymentstatusapi(cmd, resource_group_name, name
                                                   deployment_status_url, is_async, timeout,
                                                   deploy_params=None):
     response_body = None
-    logger.warning('Polling the status of %s deployment. Start Time: %s UTC',
-                   "async" if is_async else "sync",
-                   datetime.datetime.now(datetime.timezone.utc))
+    if not _uses_polished_onedeploy_preparation(deploy_params):
+        logger.warning('Polling the status of %s deployment. Start Time: %s UTC',
+                       "async" if is_async else "sync",
+                       datetime.datetime.now(datetime.timezone.utc))
     # verify if the app is a linux web app
     if deploy_params is not None:
         # Reuse the Site fetched (or cached) during the publish leg. Saves
@@ -11424,17 +11620,21 @@ def _poll_deployment_runtime_status(cmd, resource_group_name, webapp_name, slot,
         time_elapsed = int(time.time() - start_time)
         status = RUNTIME_STATUS_TEXT_MAP.get(deployment_status)
         status = deployment_status if status is None else status
-        logger.warning("Status: %s Time: %s(s)", status, time_elapsed)
-        _try_show_kudu_deployment_progress(cmd, deploy_params, progress_url)
+        structured_progress_active = _try_show_kudu_deployment_progress(
+            cmd, deploy_params, progress_url)
+        runtime_status_rendered = _show_polished_runtime_status(
+            deploy_params, deployment_status) if structured_progress_active else False
+        if not structured_progress_active or not runtime_status_rendered:
+            logger.warning("Status: %s Time: %s(s)", status, time_elapsed)
         if deployment_status == "RuntimeStarting":
-            if not status_tip_logged:
+            if not status_tip_logged and not _should_show_kudu_deployment_progress(deploy_params):
                 _log_webapp_troubleshoot_status_tip(webapp_name, resource_group_name, True)
                 status_tip_logged = True
             logger.info("InprogressInstances: %s, SuccessfulInstances: %s",
                         deployment_properties.get('numberOfInstancesInProgress'),
                         deployment_properties.get('numberOfInstancesSuccessful'))
         if deployment_status == "RuntimeSuccessful":
-            if not status_tip_logged:
+            if not status_tip_logged and not structured_progress_active:
                 _log_webapp_troubleshoot_status_tip(webapp_name, resource_group_name, True)
             break
         if deployment_status == "RuntimeFailed":
@@ -12871,7 +13071,8 @@ def _get_onedeploy_request_body(params):
     app_is_linux_webapp = False
 
     if params.src_path:
-        logger.warning('Deploying from local path: %s', params.src_path)
+        if not _uses_polished_onedeploy_preparation(params):
+            logger.warning('Deploying from local path: %s', params.src_path)
 
         if params.track_status is not None and params.track_status:
             # Was: client.web_apps.get(...). Reuses the cached Site populated
@@ -12912,7 +13113,7 @@ def _update_artifact_type(params):
     import os
 
     if params.artifact_type is not None:
-        return
+        return False
 
     # Interpret deployment type from the file extension if the type parameter is not passed
     _, file_extension = os.path.splitext(params.src_path)
@@ -12923,8 +13124,10 @@ def _update_artifact_type(params):
         params.artifact_type = 'startup'
     else:
         params.artifact_type = 'static'
-    logger.warning("Deployment type: %s. To override deployment type, please specify the --type parameter. "
-                   "Possible values: war, jar, ear, zip, startup, script, static", params.artifact_type)
+    if not _should_show_kudu_deployment_progress(params):
+        logger.warning("Deployment type: %s. To override deployment type, please specify the --type parameter. "
+                       "Possible values: war, jar, ear, zip, startup, script, static", params.artifact_type)
+    return True
 
 
 def _get_instance_id_internal(cmd, resource_group_name, webapp_name, slot):
@@ -12996,7 +13199,8 @@ def _warmup_kudu_and_get_cookie_internal(params):
                 response = send_raw_request(params.cmd.cli_ctx, "GET", kudu_warmup_url)
 
             if response.status_code in (200, 201, 202):
-                logger.warning("Warmed up Kudu instance successfully.")
+                if not _show_polished_preparation_status(params, 'Kudu warmed up', completed=True):
+                    logger.warning("Warmed up Kudu instance successfully.")
                 return cookies
             time_out = 300
         except Exception as ex:  # pylint: disable=broad-except
@@ -13027,7 +13231,8 @@ def _make_onedeploy_request(params):
         # if linux webapp and not function app, then warmup kudu and use warmed up kudu for deployment
         if params.is_linux_webapp and not params.is_functionapp and params.enable_kudu_warmup:
             try:
-                logger.warning("Warming up Kudu before deployment.")
+                if not _show_polished_preparation_status(params, 'Warming up Kudu'):
+                    logger.warning("Warming up Kudu before deployment.")
                 cookies = _warmup_kudu_and_get_cookie_internal(params)
                 if cookies is None:
                     logger.info("Failed to fetch affinity cookie for Kudu. "
@@ -13070,6 +13275,7 @@ def _make_onedeploy_request(params):
     # pylint: disable=too-many-nested-blocks
     if response.status_code == 202 or response.status_code == 200:
         response_body = None
+        _show_polished_preparation_status(params, 'Deployment request accepted', completed=True)
         if poll_async_deployment_for_debugging:
             if params.track_status is not None and params.track_status:
                 response_body = _check_runtimestatus_with_deploymentstatusapi(
@@ -13094,13 +13300,15 @@ def _make_onedeploy_request(params):
                 response_body = response.json().get("properties", {})
         if params.src_url:
             logger.warning("Deployment was submitted asynchronously")
-        else:
+        polished_completion_rendered = _show_polished_onedeploy_completion(params)
+        if not params.src_url and not polished_completion_rendered:
             logger.warning("Deployment has completed successfully")
-        if not (poll_async_deployment_for_debugging and params.track_status):
+        if not polished_completion_rendered and not (poll_async_deployment_for_debugging and params.track_status):
             _log_webapp_troubleshoot_status_tip(params.webapp_name, params.resource_group_name, params.is_linux_webapp)
         if params.show_secure_build:
             _show_secure_build_after_deployment(params)
-        logger.warning("You can visit your app at: %s", _get_visit_url(params))
+        if not polished_completion_rendered:
+            logger.warning("You can visit your app at: %s", _get_visit_url(params))
         return response_body
 
     # API not available yet!
@@ -13155,11 +13363,20 @@ def _try_enrich_and_raise(params, **kwargs):
 def _perform_onedeploy_internal(params):
 
     # Update artifact type, if required
-    _update_artifact_type(params)
+    artifact_type_inferred = _update_artifact_type(params)
     _should_enrich_errors = params.enriched_errors and params.is_linux_webapp and not params.is_functionapp
 
     # Now make the OneDeploy API call
-    logger.warning("Initiating deployment")
+    if _should_show_kudu_deployment_progress(params):
+        state = _get_kudu_deployment_progress_state(params)
+        state['deployment_started_at'] = time.time()
+        if not _show_polished_onedeploy_preamble(params):
+            if artifact_type_inferred:
+                logger.warning("Deployment type: %s. To override deployment type, please specify the --type parameter. "
+                               "Possible values: war, jar, ear, zip, startup, script, static", params.artifact_type)
+            logger.warning("Initiating deployment")
+    else:
+        logger.warning("Initiating deployment")
     try:
         try:
             response = _make_onedeploy_request(params)
