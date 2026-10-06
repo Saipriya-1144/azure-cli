@@ -2150,7 +2150,9 @@ class TestKuduDeploymentProgressMocked(unittest.TestCase):
     @mock.patch('azure.cli.command_modules.appservice.custom.logger')
     def test_runtime_poll_renders_deduplicates_transitions_and_details(
             self, logger_mock, requests_get_mock, send_raw_mock, _time_mock, _sleep_mock, _tip_mock):
-        from azure.cli.command_modules.appservice.custom import _poll_deployment_runtime_status
+        from azure.cli.command_modules.appservice.custom import (
+            _KUDU_DEPLOYMENT_PROGRESS_REQUEST_TIMEOUT,
+            _poll_deployment_runtime_status)
 
         progress_url = 'https://myapp.scm.azurewebsites.net/api/deployments/deploy-1/progress'
         details_url = 'https://myapp.scm.azurewebsites.net/api/deployments/deploy-1/progress/2'
@@ -2191,7 +2193,7 @@ class TestKuduDeploymentProgressMocked(unittest.TestCase):
         }
         details = [
             {'id': 'detail-1', 'message': 'Restoring dependencies.'},
-            {'id': 'detail-2', 'message': 'Unapproved arbitrary deployment content.'},
+            {'id': 'detail-2', 'message': 'Unsafe arbitrary\ndeployment content.'},
         ]
         requests_get_mock.side_effect = [
             self._response(payload=base_progress),
@@ -2218,6 +2220,9 @@ class TestKuduDeploymentProgressMocked(unittest.TestCase):
         self.assertEqual([call.args[0] for call in progress_calls], [progress_url] * 3)
         for request_call in requests_get_mock.call_args_list:
             self.assertIs(request_call.kwargs['headers']['Authorization'], mock.sentinel.authorization)
+            self.assertEqual(
+                request_call.kwargs['timeout'],
+                _KUDU_DEPLOYMENT_PROGRESS_REQUEST_TIMEOUT)
         rendered = self._rendered_warnings(logger_mock)
         self.assertEqual(
             [message for message in rendered if message.startswith('[') or message.startswith('      ')],
@@ -2227,7 +2232,75 @@ class TestKuduDeploymentProgressMocked(unittest.TestCase):
                 '      Restoring dependencies.',
                 '[2/2] Building - Succeeded',
             ])
-        self.assertNotIn('Unapproved arbitrary deployment content.', rendered)
+        self.assertNotIn('Unsafe arbitrary\ndeployment content.', rendered)
+
+    @mock.patch('requests.get')
+    @mock.patch('azure.cli.command_modules.appservice.custom.logger')
+    def test_progress_details_accept_contract_messages_and_reject_unsafe_content(
+            self, logger_mock, requests_get_mock):
+        from azure.cli.command_modules.appservice.custom import (
+            _KUDU_DEPLOYMENT_PROGRESS_DETAIL_MAX_LENGTH,
+            _KUDU_DEPLOYMENT_PROGRESS_REQUEST_TIMEOUT,
+            _try_show_kudu_deployment_progress)
+        progress_url = 'https://myapp.scm.azurewebsites.net/api/deployments/deploy-1/progress'
+        details_url = 'https://myapp.scm.azurewebsites.net/api/deployments/deploy-1/progress/1'
+        approved_messages = [
+            'Generating the build script.',
+            'Running pre-build steps.',
+            'Restoring dependencies.',
+            'Building the application.',
+            'Running post-build steps.',
+            'Preparing build output.',
+            'Compressing build output.',
+            'Writing the build manifest.',
+            'Copied 42 of 100 files.',
+        ]
+        unsafe_messages = [
+            '',
+            '   ',
+            'line one\rline two',
+            'line one\nline two',
+            'unsafe\x00detail',
+            'x' * (_KUDU_DEPLOYMENT_PROGRESS_DETAIL_MAX_LENGTH + 1),
+        ]
+        progress = {
+            'status': 'in_progress',
+            'total_steps': 1,
+            'steps': ['Building'],
+            'progress': [{
+                'step_number': 1,
+                'stage': 'Building',
+                'status': 'in_progress',
+                'started_at': '2026-10-06T08:00:00Z',
+                'completed_at': None,
+                'details_url': details_url,
+            }],
+        }
+        details = [
+            {'id': 'detail-{}'.format(index), 'message': message}
+            for index, message in enumerate(approved_messages + unsafe_messages)
+        ]
+        requests_get_mock.side_effect = [
+            self._response(payload=progress),
+            self._response(payload=details),
+        ]
+        params = self._params()
+
+        _try_show_kudu_deployment_progress(params.cmd, params, progress_url)
+
+        rendered_details = [
+            message for message in self._rendered_warnings(logger_mock)
+            if message.startswith('      ')
+        ]
+        self.assertEqual(
+            rendered_details,
+            ['      {}'.format(message) for message in approved_messages])
+        for unsafe_message in unsafe_messages:
+            self.assertNotIn('      {}'.format(unsafe_message), rendered_details)
+        for request_call in requests_get_mock.call_args_list:
+            self.assertEqual(
+                request_call.kwargs['timeout'],
+                _KUDU_DEPLOYMENT_PROGRESS_REQUEST_TIMEOUT)
 
     @mock.patch('azure.cli.command_modules.appservice.custom._poll_deployment_runtime_status')
     @mock.patch('azure.cli.command_modules.appservice.custom._build_deploymentstatus_url',
@@ -2294,7 +2367,9 @@ class TestKuduDeploymentProgressMocked(unittest.TestCase):
     @mock.patch('azure.cli.command_modules.appservice.custom.logger')
     def test_direct_kudu_fallback_uses_returned_progress_url(
             self, logger_mock, requests_get_mock, _sleep_mock):
-        from azure.cli.command_modules.appservice.custom import _check_zip_deployment_status
+        from azure.cli.command_modules.appservice.custom import (
+            _KUDU_DEPLOYMENT_PROGRESS_REQUEST_TIMEOUT,
+            _check_zip_deployment_status)
         progress_url = 'https://myapp.scm.azurewebsites.net/api/deployments/deploy-1/progress'
         requests_get_mock.side_effect = [
             self._response(payload={'status': 4, 'progress_url': progress_url}),
@@ -2321,6 +2396,10 @@ class TestKuduDeploymentProgressMocked(unittest.TestCase):
 
         self.assertEqual(result['status'], 4)
         self.assertEqual(requests_get_mock.call_args_list[1].args[0], progress_url)
+        self.assertNotIn('timeout', requests_get_mock.call_args_list[0].kwargs)
+        self.assertEqual(
+            requests_get_mock.call_args_list[1].kwargs['timeout'],
+            _KUDU_DEPLOYMENT_PROGRESS_REQUEST_TIMEOUT)
         self.assertIn('[1/1] Deploying - Succeeded', self._rendered_warnings(logger_mock))
 
     @mock.patch('azure.cli.command_modules.appservice.custom.time.sleep')
@@ -2371,6 +2450,7 @@ class TestKuduDeploymentProgressMocked(unittest.TestCase):
     @mock.patch('azure.cli.command_modules.appservice.custom.logger')
     def test_progress_request_failures_are_non_fatal(
             self, logger_mock, requests_get_mock, _sleep_mock):
+        from requests.exceptions import Timeout
         from azure.cli.command_modules.appservice.custom import _check_zip_deployment_status
         progress_url = 'https://myapp.scm.azurewebsites.net/api/deployments/deploy-1/progress'
         progress_failures = (
@@ -2378,6 +2458,7 @@ class TestKuduDeploymentProgressMocked(unittest.TestCase):
             self._response(status_code=401),
             self._response(json_error=ValueError('malformed')),
             self._response(payload=['unexpected']),
+            Timeout('progress request timed out'),
             RuntimeError('request failed'),
         )
 
@@ -2403,7 +2484,10 @@ class TestKuduDeploymentProgressMocked(unittest.TestCase):
     @mock.patch('requests.get')
     @mock.patch('azure.cli.command_modules.appservice.custom.logger')
     def test_progress_detail_failures_are_non_fatal(self, logger_mock, requests_get_mock):
-        from azure.cli.command_modules.appservice.custom import _try_show_kudu_deployment_progress
+        from requests.exceptions import Timeout
+        from azure.cli.command_modules.appservice.custom import (
+            _KUDU_DEPLOYMENT_PROGRESS_REQUEST_TIMEOUT,
+            _try_show_kudu_deployment_progress)
         progress_url = 'https://myapp.scm.azurewebsites.net/api/deployments/deploy-1/progress'
         details_url = 'https://myapp.scm.azurewebsites.net/api/deployments/deploy-1/progress/1'
         progress = {
@@ -2422,6 +2506,7 @@ class TestKuduDeploymentProgressMocked(unittest.TestCase):
         detail_failures = (
             self._response(status_code=404),
             self._response(json_error=ValueError('malformed')),
+            Timeout('progress details request timed out'),
             RuntimeError('request failed'),
         )
 
@@ -2438,6 +2523,9 @@ class TestKuduDeploymentProgressMocked(unittest.TestCase):
                 _try_show_kudu_deployment_progress(params.cmd, params, progress_url)
 
                 self.assertEqual(requests_get_mock.call_count, 2)
+                self.assertEqual(
+                    requests_get_mock.call_args_list[1].kwargs['timeout'],
+                    _KUDU_DEPLOYMENT_PROGRESS_REQUEST_TIMEOUT)
                 self.assertIn('[1/1] Building - In progress', self._rendered_warnings(logger_mock))
 
 

@@ -11100,13 +11100,8 @@ _KUDU_DEPLOYMENT_PROGRESS_STATUSES = {
     'canceled': 'Canceled',
 }
 
-_KUDU_DEPLOYMENT_PROGRESS_DETAIL_MESSAGES = frozenset({
-    'Generating the build script.',
-    'Restoring dependencies.',
-    'Building the application.',
-    'Preparing build output.',
-    'Writing the build manifest.',
-})
+_KUDU_DEPLOYMENT_PROGRESS_REQUEST_TIMEOUT = 5
+_KUDU_DEPLOYMENT_PROGRESS_DETAIL_MAX_LENGTH = 512
 
 
 def _should_show_kudu_deployment_progress(deploy_params):
@@ -11159,7 +11154,8 @@ def _show_kudu_deployment_progress(progress_url, headers, state):  # pylint: dis
 
     try:
         response = requests.get(progress_url, headers=headers,
-                                verify=not should_disable_connection_verify())
+                                verify=not should_disable_connection_verify(),
+                                timeout=_KUDU_DEPLOYMENT_PROGRESS_REQUEST_TIMEOUT)
         if response.status_code != 200:
             logger.debug("Kudu deployment progress is unavailable.")
             return
@@ -11211,7 +11207,8 @@ def _show_kudu_deployment_progress_details(details_url, headers, state):
 
     try:
         response = requests.get(details_url, headers=headers,
-                                verify=not should_disable_connection_verify())
+                                verify=not should_disable_connection_verify(),
+                                timeout=_KUDU_DEPLOYMENT_PROGRESS_REQUEST_TIMEOUT)
         if response.status_code != 200:
             logger.debug("Kudu deployment progress details are unavailable.")
             return
@@ -11226,7 +11223,7 @@ def _show_kudu_deployment_progress_details(details_url, headers, state):
         if not isinstance(entry, dict):
             continue
         message = entry.get('message')
-        if message not in _KUDU_DEPLOYMENT_PROGRESS_DETAIL_MESSAGES:
+        if not _is_safe_kudu_deployment_progress_detail(message):
             continue
         detail_id = entry.get('id')
         identity = (details_url, detail_id) if isinstance(detail_id, (str, int)) else (details_url, message)
@@ -11235,6 +11232,13 @@ def _show_kudu_deployment_progress_details(details_url, headers, state):
         logger.warning("      %s", message)
         state['detail_ids'].add(identity)
         state['detail_messages'].add(message)
+
+
+def _is_safe_kudu_deployment_progress_detail(message):
+    return isinstance(message, str) and \
+        bool(message.strip()) and \
+        len(message) <= _KUDU_DEPLOYMENT_PROGRESS_DETAIL_MAX_LENGTH and \
+        message.isprintable()
 
 
 def _check_zip_deployment_status(cmd, rg_name, name, deployment_status_url, slot, timeout=None,
