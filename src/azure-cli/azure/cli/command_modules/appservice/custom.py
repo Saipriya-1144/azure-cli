@@ -11093,6 +11093,150 @@ def _list_managed_instance_locations(cmd, sku_tier):
     return [SimpleNamespace(**location) for location in locations]
 
 
+_KUDU_DEPLOYMENT_PROGRESS_STATUSES = {
+    'in_progress': 'In progress',
+    'succeeded': 'Succeeded',
+    'failed': 'Failed',
+    'canceled': 'Canceled',
+}
+
+_KUDU_DEPLOYMENT_PROGRESS_DETAIL_MESSAGES = frozenset({
+    'Generating the build script.',
+    'Restoring dependencies.',
+    'Building the application.',
+    'Preparing build output.',
+    'Writing the build manifest.',
+})
+
+
+def _should_show_kudu_deployment_progress(deploy_params):
+    return deploy_params is not None and \
+        deploy_params.is_linux_webapp is True and \
+        deploy_params.is_functionapp is False
+
+
+def _get_kudu_deployment_progress_state(deploy_params):
+    state = getattr(deploy_params, '_kudu_progress_state', None)
+    if not isinstance(state, dict):
+        state = {
+            'step_statuses': {},
+            'detail_ids': set(),
+            'detail_messages': set(),
+        }
+        deploy_params._kudu_progress_state = state  # pylint: disable=protected-access
+    return state
+
+
+def _get_cached_scm_headers_for_progress(cmd, deploy_params):
+    cached_headers = getattr(deploy_params, '_cached_scm_headers', None)
+    if cached_headers is None:
+        return None
+    headers = dict(cached_headers)
+    client_id = (cmd.cli_ctx.data or {}).get('headers', {}).get('x-ms-client-request-id')
+    if client_id:
+        headers['x-ms-client-request-id'] = client_id
+    return headers
+
+
+def _try_show_kudu_deployment_progress(cmd, deploy_params, progress_url, headers=None):
+    if not _should_show_kudu_deployment_progress(deploy_params):
+        return
+    try:
+        progress_headers = headers or _get_cached_scm_headers_for_progress(cmd, deploy_params)
+        _show_kudu_deployment_progress(
+            progress_url, progress_headers,
+            _get_kudu_deployment_progress_state(deploy_params))
+    except Exception:  # pylint: disable=broad-except
+        logger.debug("Kudu deployment progress is unavailable.")
+
+
+def _show_kudu_deployment_progress(progress_url, headers, state):  # pylint: disable=too-many-return-statements
+    import requests
+    from azure.cli.core.util import should_disable_connection_verify
+
+    if not isinstance(progress_url, str) or not progress_url or not headers:
+        return
+
+    try:
+        response = requests.get(progress_url, headers=headers,
+                                verify=not should_disable_connection_verify())
+        if response.status_code != 200:
+            logger.debug("Kudu deployment progress is unavailable.")
+            return
+        snapshot = response.json()
+    except Exception:  # pylint: disable=broad-except
+        logger.debug("Kudu deployment progress is unavailable.")
+        return
+
+    if not isinstance(snapshot, dict) or snapshot.get('status') not in _KUDU_DEPLOYMENT_PROGRESS_STATUSES:
+        return
+
+    total_steps = snapshot.get('total_steps')
+    steps = snapshot.get('steps')
+    progress = snapshot.get('progress')
+    if isinstance(total_steps, bool) or not isinstance(total_steps, int) or total_steps <= 0:
+        return
+    if not isinstance(steps, list) or len(steps) != total_steps:
+        return
+    if not all(isinstance(stage, str) and stage for stage in steps) or not isinstance(progress, list):
+        return
+
+    for entry in progress:
+        if not isinstance(entry, dict):
+            continue
+        step_number = entry.get('step_number')
+        stage = entry.get('stage')
+        status = entry.get('status')
+        if isinstance(step_number, bool) or not isinstance(step_number, int) or \
+                step_number < 1 or step_number > total_steps:
+            continue
+        if stage != steps[step_number - 1] or status not in _KUDU_DEPLOYMENT_PROGRESS_STATUSES:
+            continue
+
+        step_key = (step_number, stage)
+        if state['step_statuses'].get(step_key) != status:
+            logger.warning("[%s/%s] %s - %s",
+                           step_number, total_steps, stage,
+                           _KUDU_DEPLOYMENT_PROGRESS_STATUSES[status])
+            state['step_statuses'][step_key] = status
+
+        details_url = entry.get('details_url')
+        if isinstance(details_url, str) and details_url:
+            _show_kudu_deployment_progress_details(details_url, headers, state)
+
+
+def _show_kudu_deployment_progress_details(details_url, headers, state):
+    import requests
+    from azure.cli.core.util import should_disable_connection_verify
+
+    try:
+        response = requests.get(details_url, headers=headers,
+                                verify=not should_disable_connection_verify())
+        if response.status_code != 200:
+            logger.debug("Kudu deployment progress details are unavailable.")
+            return
+        entries = response.json()
+    except Exception:  # pylint: disable=broad-except
+        logger.debug("Kudu deployment progress details are unavailable.")
+        return
+
+    if not isinstance(entries, list):
+        return
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        message = entry.get('message')
+        if message not in _KUDU_DEPLOYMENT_PROGRESS_DETAIL_MESSAGES:
+            continue
+        detail_id = entry.get('id')
+        identity = (details_url, detail_id) if isinstance(detail_id, (str, int)) else (details_url, message)
+        if identity in state['detail_ids'] or message in state['detail_messages']:
+            continue
+        logger.warning("      %s", message)
+        state['detail_ids'].add(identity)
+        state['detail_messages'].add(message)
+
+
 def _check_zip_deployment_status(cmd, rg_name, name, deployment_status_url, slot, timeout=None,
                                  deploy_params=None):
     import requests
@@ -11137,6 +11281,9 @@ def _check_zip_deployment_status(cmd, rg_name, name, deployment_status_url, slot
         finally:
             num_trials = num_trials + 1
 
+        _try_show_kudu_deployment_progress(
+            cmd, deploy_params, res_dict.get('progress_url'), headers=headers)
+
         if res_dict.get('status', 0) == 3:
             _configure_default_logging(cmd, rg_name, name)
             raise CLIError("Zip deployment failed. {}. Please run the command az webapp log deployment show "
@@ -11153,7 +11300,8 @@ def _check_zip_deployment_status(cmd, rg_name, name, deployment_status_url, slot
     return res_dict
 
 
-def _get_latest_deployment_id(cmd, rg_name, name, deployment_status_url, slot, deploy_params=None):
+def _get_latest_deployment_id(cmd, rg_name, name, deployment_status_url, slot, deploy_params=None,
+                              include_progress_url=False):
     import requests
     from azure.cli.core.util import should_disable_connection_verify
 
@@ -11185,16 +11333,21 @@ def _get_latest_deployment_id(cmd, rg_name, name, deployment_status_url, slot, d
             except Exception as ex:  # pylint: disable=broad-except
                 logger.warning("Deployment status endpoint %s returned malformed data. Exception: %s "
                                "\nRetrying...", deployment_status_url, ex)
-                return None
+                return (None, None) if include_progress_url else None
             finally:
                 num_trials = num_trials + 1
             if 'id' in res_dict and 'temp' not in res_dict['id']:
+                if include_progress_url:
+                    progress_url = res_dict.get('progress_url')
+                    if not isinstance(progress_url, str) or not progress_url:
+                        progress_url = None
+                    return res_dict['id'], progress_url
                 return res_dict['id']
         # catch all errors
         except Exception as ex:  # pylint: disable=broad-except
             logger.warning("Deployment status endpoint %s returned error: %s.", deployment_status_url, ex)
             break
-    return None
+    return (None, None) if include_progress_url else None
 
 
 def _check_runtimestatus_with_deploymentstatusapi(cmd, resource_group_name, name, slot,
@@ -11221,9 +11374,9 @@ def _check_runtimestatus_with_deploymentstatusapi(cmd, resource_group_name, name
     else:
         # get the deployment id
         # once deploymentstatus/latest is available, we can use it to track the deployment
-        deployment_id = _get_latest_deployment_id(cmd, resource_group_name,
-                                                  name, deployment_status_url, slot,
-                                                  deploy_params=deploy_params)
+        deployment_id, progress_url = _get_latest_deployment_id(
+            cmd, resource_group_name, name, deployment_status_url, slot,
+            deploy_params=deploy_params, include_progress_url=True)
         if deployment_id is None:
             logger.warning("Failed to enable tracking runtime status for this deployment. "
                            "Resuming without tracking status.")
@@ -11234,7 +11387,8 @@ def _check_runtimestatus_with_deploymentstatusapi(cmd, resource_group_name, name
                                                                   name, slot, deployment_id)
             response_body = _poll_deployment_runtime_status(cmd, resource_group_name, name, slot,
                                                             deploymentstatisapi_url, deployment_id, timeout,
-                                                            deploy_params=deploy_params)
+                                                            deploy_params=deploy_params,
+                                                            progress_url=progress_url)
             # incase we are unable to fetch response from deploymentstatus API
             # fallback to polling kudu for deployment status
             if response_body is None:
@@ -11247,7 +11401,7 @@ def _check_runtimestatus_with_deploymentstatusapi(cmd, resource_group_name, name
 
 # pylint: disable=too-many-branches
 def _poll_deployment_runtime_status(cmd, resource_group_name, webapp_name, slot, deploymentstatusapi_url,
-                                    deployment_id, timeout=None, deploy_params=None):
+                                    deployment_id, timeout=None, deploy_params=None, progress_url=None):
     max_time_sec = int(timeout) if timeout else 1000
     start_time = time.time()
     time_elapsed = 0
@@ -11267,6 +11421,7 @@ def _poll_deployment_runtime_status(cmd, resource_group_name, webapp_name, slot,
         status = RUNTIME_STATUS_TEXT_MAP.get(deployment_status)
         status = deployment_status if status is None else status
         logger.warning("Status: %s Time: %s(s)", status, time_elapsed)
+        _try_show_kudu_deployment_progress(cmd, deploy_params, progress_url)
         if deployment_status == "RuntimeStarting":
             if not status_tip_logged:
                 _log_webapp_troubleshoot_status_tip(webapp_name, resource_group_name, True)
@@ -12490,6 +12645,7 @@ class OneDeployParams:
         # host_name_ssl_states on each access (trivial iteration).
         self._cached_scm_headers = None
         self._cached_site = None
+        self._kudu_progress_state = None
 # pylint: enable=too-many-instance-attributes,too-few-public-methods
 
 
@@ -13019,6 +13175,7 @@ def _perform_onedeploy_internal(params):
         # by any outer exception handler or telemetry path.
         params._cached_scm_headers = None  # pylint: disable=protected-access
         params._cached_site = None  # pylint: disable=protected-access
+        params._kudu_progress_state = None  # pylint: disable=protected-access
 
 
 def _wait_for_webapp(tunnel_server):

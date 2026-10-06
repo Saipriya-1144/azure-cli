@@ -2112,6 +2112,335 @@ class TestTroubleshootStatusMocked(unittest.TestCase):
         self.assertEqual(row['Failed (last 24h)'], 2)
 
 
+class TestKuduDeploymentProgressMocked(unittest.TestCase):
+
+    @staticmethod
+    def _response(status_code=200, payload=None, json_error=None):
+        response = mock.MagicMock(status_code=status_code)
+        if json_error is not None:
+            response.json.side_effect = json_error
+        else:
+            response.json.return_value = payload
+        return response
+
+    @staticmethod
+    def _params(is_linux=True, is_functionapp=False):
+        from azure.cli.command_modules.appservice.custom import OneDeployParams
+        params = OneDeployParams()
+        params.cmd = _get_test_cmd()
+        params.resource_group_name = 'myRG'
+        params.webapp_name = 'myApp'
+        params.is_linux_webapp = is_linux
+        params.is_functionapp = is_functionapp
+        params._cached_scm_headers = {  # pylint: disable=protected-access
+            'Authorization': mock.sentinel.authorization,
+            'User-Agent': 'AzureCLI/test',
+        }
+        return params
+
+    @staticmethod
+    def _rendered_warnings(logger_mock):
+        return [call.args[0] % call.args[1:] for call in logger_mock.warning.call_args_list]
+
+    @mock.patch('azure.cli.command_modules.appservice.custom._log_webapp_troubleshoot_status_tip')
+    @mock.patch('azure.cli.command_modules.appservice.custom.time.sleep')
+    @mock.patch('azure.cli.command_modules.appservice.custom.time.time', return_value=0)
+    @mock.patch('azure.cli.command_modules.appservice.custom.send_raw_request')
+    @mock.patch('requests.get')
+    @mock.patch('azure.cli.command_modules.appservice.custom.logger')
+    def test_runtime_poll_renders_deduplicates_transitions_and_details(
+            self, logger_mock, requests_get_mock, send_raw_mock, _time_mock, _sleep_mock, _tip_mock):
+        from azure.cli.command_modules.appservice.custom import _poll_deployment_runtime_status
+
+        progress_url = 'https://myapp.scm.azurewebsites.net/api/deployments/deploy-1/progress'
+        details_url = 'https://myapp.scm.azurewebsites.net/api/deployments/deploy-1/progress/2'
+        base_progress = {
+            'status': 'in_progress',
+            'total_steps': 2,
+            'steps': ['Validating', 'Building'],
+            'progress': [
+                {
+                    'step_number': 1,
+                    'stage': 'Validating',
+                    'status': 'succeeded',
+                    'started_at': '2026-10-06T08:00:00Z',
+                    'completed_at': '2026-10-06T08:00:01Z',
+                    'details_url': None,
+                },
+                {
+                    'step_number': 2,
+                    'stage': 'Building',
+                    'status': 'in_progress',
+                    'started_at': '2026-10-06T08:00:01Z',
+                    'completed_at': None,
+                    'details_url': details_url,
+                },
+            ],
+        }
+        completed_progress = {
+            **base_progress,
+            'status': 'succeeded',
+            'progress': [
+                base_progress['progress'][0],
+                {
+                    **base_progress['progress'][1],
+                    'status': 'succeeded',
+                    'completed_at': '2026-10-06T08:00:10Z',
+                },
+            ],
+        }
+        details = [
+            {'id': 'detail-1', 'message': 'Restoring dependencies.'},
+            {'id': 'detail-2', 'message': 'Unapproved arbitrary deployment content.'},
+        ]
+        requests_get_mock.side_effect = [
+            self._response(payload=base_progress),
+            self._response(payload=details),
+            self._response(payload=base_progress),
+            self._response(payload=details),
+            self._response(payload=completed_progress),
+            self._response(payload=details),
+        ]
+        send_raw_mock.side_effect = [
+            self._response(payload={'properties': {'status': 'BuildInProgress'}}),
+            self._response(payload={'properties': {'status': 'BuildInProgress'}}),
+            self._response(payload={'properties': {'status': 'RuntimeSuccessful'}}),
+        ]
+        params = self._params()
+
+        result = _poll_deployment_runtime_status(
+            params.cmd, 'myRG', 'myApp', None,
+            'https://management.azure.com/deploymentstatus', 'deploy-1',
+            deploy_params=params, progress_url=progress_url)
+
+        self.assertEqual(result['properties']['status'], 'RuntimeSuccessful')
+        progress_calls = requests_get_mock.call_args_list[::2]
+        self.assertEqual([call.args[0] for call in progress_calls], [progress_url] * 3)
+        for request_call in requests_get_mock.call_args_list:
+            self.assertIs(request_call.kwargs['headers']['Authorization'], mock.sentinel.authorization)
+        rendered = self._rendered_warnings(logger_mock)
+        self.assertEqual(
+            [message for message in rendered if message.startswith('[') or message.startswith('      ')],
+            [
+                '[1/2] Validating - Succeeded',
+                '[2/2] Building - In progress',
+                '      Restoring dependencies.',
+                '[2/2] Building - Succeeded',
+            ])
+        self.assertNotIn('Unapproved arbitrary deployment content.', rendered)
+
+    @mock.patch('azure.cli.command_modules.appservice.custom._poll_deployment_runtime_status')
+    @mock.patch('azure.cli.command_modules.appservice.custom._build_deploymentstatus_url',
+                return_value='https://management.azure.com/deploymentstatus')
+    @mock.patch('azure.cli.command_modules.appservice.custom._get_latest_deployment_id',
+                return_value=('deploy-1', 'https://myapp.scm.azurewebsites.net/progress'))
+    def test_runtime_status_flow_carries_kudu_progress_url(
+            self, latest_mock, _build_url_mock, poll_mock):
+        from azure.cli.command_modules.appservice.custom import _check_runtimestatus_with_deploymentstatusapi
+        params = self._params()
+        params._cached_site = mock.MagicMock(kind='app,linux', reserved=True)  # pylint: disable=protected-access
+        poll_mock.return_value = {'properties': {'status': 'RuntimeSuccessful'}}
+
+        result = _check_runtimestatus_with_deploymentstatusapi(
+            params.cmd, 'myRG', 'myApp', None,
+            'https://myapp.scm.azurewebsites.net/api/deployments/latest',
+            is_async=False, timeout=60, deploy_params=params)
+
+        self.assertEqual(result['properties']['status'], 'RuntimeSuccessful')
+        self.assertTrue(latest_mock.call_args.kwargs['include_progress_url'])
+        self.assertEqual(
+            poll_mock.call_args.kwargs['progress_url'],
+            'https://myapp.scm.azurewebsites.net/progress')
+
+    @mock.patch('azure.cli.command_modules.appservice.custom.time.sleep')
+    @mock.patch('requests.get')
+    def test_latest_deployment_id_preserves_legacy_return_shape(
+            self, requests_get_mock, _sleep_mock):
+        from azure.cli.command_modules.appservice.custom import _get_latest_deployment_id
+        progress_url = 'https://myapp.scm.azurewebsites.net/api/deployments/deploy-1/progress'
+        requests_get_mock.return_value = self._response(
+            payload={'id': 'deploy-1', 'progress_url': progress_url})
+        params = self._params()
+
+        deployment_id = _get_latest_deployment_id(
+            params.cmd, 'myRG', 'myApp',
+            'https://myapp.scm.azurewebsites.net/api/deployments/latest',
+            None, deploy_params=params)
+        deployment_info = _get_latest_deployment_id(
+            params.cmd, 'myRG', 'myApp',
+            'https://myapp.scm.azurewebsites.net/api/deployments/latest',
+            None, deploy_params=params, include_progress_url=True)
+
+        self.assertEqual(deployment_id, 'deploy-1')
+        self.assertEqual(deployment_info, ('deploy-1', progress_url))
+
+    @mock.patch('azure.cli.command_modules.appservice.custom.time.sleep')
+    @mock.patch('requests.get')
+    def test_latest_deployment_info_malformed_response_preserves_fallback(
+            self, requests_get_mock, _sleep_mock):
+        from azure.cli.command_modules.appservice.custom import _get_latest_deployment_id
+        requests_get_mock.return_value = self._response(json_error=ValueError('malformed'))
+        params = self._params()
+
+        deployment_info = _get_latest_deployment_id(
+            params.cmd, 'myRG', 'myApp',
+            'https://myapp.scm.azurewebsites.net/api/deployments/latest',
+            None, deploy_params=params, include_progress_url=True)
+
+        self.assertEqual(deployment_info, (None, None))
+
+    @mock.patch('azure.cli.command_modules.appservice.custom.time.sleep')
+    @mock.patch('requests.get')
+    @mock.patch('azure.cli.command_modules.appservice.custom.logger')
+    def test_direct_kudu_fallback_uses_returned_progress_url(
+            self, logger_mock, requests_get_mock, _sleep_mock):
+        from azure.cli.command_modules.appservice.custom import _check_zip_deployment_status
+        progress_url = 'https://myapp.scm.azurewebsites.net/api/deployments/deploy-1/progress'
+        requests_get_mock.side_effect = [
+            self._response(payload={'status': 4, 'progress_url': progress_url}),
+            self._response(payload={
+                'status': 'succeeded',
+                'total_steps': 1,
+                'steps': ['Deploying'],
+                'progress': [{
+                    'step_number': 1,
+                    'stage': 'Deploying',
+                    'status': 'succeeded',
+                    'started_at': '2026-10-06T08:00:00Z',
+                    'completed_at': '2026-10-06T08:00:10Z',
+                    'details_url': None,
+                }],
+            }),
+        ]
+        params = self._params()
+
+        result = _check_zip_deployment_status(
+            params.cmd, 'myRG', 'myApp',
+            'https://myapp.scm.azurewebsites.net/api/deployments/latest',
+            None, timeout=10, deploy_params=params)
+
+        self.assertEqual(result['status'], 4)
+        self.assertEqual(requests_get_mock.call_args_list[1].args[0], progress_url)
+        self.assertIn('[1/1] Deploying - Succeeded', self._rendered_warnings(logger_mock))
+
+    @mock.patch('azure.cli.command_modules.appservice.custom.time.sleep')
+    @mock.patch('requests.get')
+    @mock.patch('azure.cli.command_modules.appservice.custom.logger')
+    def test_direct_kudu_fallback_skips_absent_progress_url(
+            self, logger_mock, requests_get_mock, _sleep_mock):
+        from azure.cli.command_modules.appservice.custom import _check_zip_deployment_status
+        requests_get_mock.return_value = self._response(payload={'status': 4})
+        params = self._params()
+
+        result = _check_zip_deployment_status(
+            params.cmd, 'myRG', 'myApp',
+            'https://myapp.scm.azurewebsites.net/api/deployments/latest',
+            None, timeout=10, deploy_params=params)
+
+        self.assertEqual(result['status'], 4)
+        requests_get_mock.assert_called_once()
+        self.assertFalse(any(message.startswith('[') for message in self._rendered_warnings(logger_mock)))
+
+    @mock.patch('azure.cli.command_modules.appservice.custom.time.sleep')
+    @mock.patch('requests.get')
+    @mock.patch('azure.cli.command_modules.appservice.custom.logger')
+    def test_direct_kudu_fallback_skips_windows_and_function_apps(
+            self, logger_mock, requests_get_mock, _sleep_mock):
+        from azure.cli.command_modules.appservice.custom import _check_zip_deployment_status
+        progress_url = 'https://myapp.scm.azurewebsites.net/api/deployments/deploy-1/progress'
+
+        for is_linux, is_functionapp in ((False, False), (True, True)):
+            with self.subTest(is_linux=is_linux, is_functionapp=is_functionapp):
+                requests_get_mock.reset_mock()
+                logger_mock.reset_mock()
+                requests_get_mock.return_value = self._response(
+                    payload={'status': 4, 'progress_url': progress_url})
+                params = self._params(is_linux=is_linux, is_functionapp=is_functionapp)
+
+                result = _check_zip_deployment_status(
+                    params.cmd, 'myRG', 'myApp',
+                    'https://myapp.scm.azurewebsites.net/api/deployments/latest',
+                    None, timeout=10, deploy_params=params)
+
+                self.assertEqual(result['status'], 4)
+                requests_get_mock.assert_called_once()
+                self.assertFalse(any(message.startswith('[') for message in self._rendered_warnings(logger_mock)))
+
+    @mock.patch('azure.cli.command_modules.appservice.custom.time.sleep')
+    @mock.patch('requests.get')
+    @mock.patch('azure.cli.command_modules.appservice.custom.logger')
+    def test_progress_request_failures_are_non_fatal(
+            self, logger_mock, requests_get_mock, _sleep_mock):
+        from azure.cli.command_modules.appservice.custom import _check_zip_deployment_status
+        progress_url = 'https://myapp.scm.azurewebsites.net/api/deployments/deploy-1/progress'
+        progress_failures = (
+            self._response(status_code=404),
+            self._response(status_code=401),
+            self._response(json_error=ValueError('malformed')),
+            self._response(payload=['unexpected']),
+            RuntimeError('request failed'),
+        )
+
+        for progress_failure in progress_failures:
+            with self.subTest(progress_failure=type(progress_failure).__name__):
+                requests_get_mock.reset_mock()
+                logger_mock.reset_mock()
+                requests_get_mock.side_effect = [
+                    self._response(payload={'status': 4, 'progress_url': progress_url}),
+                    progress_failure,
+                ]
+                params = self._params()
+
+                result = _check_zip_deployment_status(
+                    params.cmd, 'myRG', 'myApp',
+                    'https://myapp.scm.azurewebsites.net/api/deployments/latest',
+                    None, timeout=10, deploy_params=params)
+
+                self.assertEqual(result['status'], 4)
+                self.assertEqual(requests_get_mock.call_count, 2)
+                self.assertFalse(any(message.startswith('[') for message in self._rendered_warnings(logger_mock)))
+
+    @mock.patch('requests.get')
+    @mock.patch('azure.cli.command_modules.appservice.custom.logger')
+    def test_progress_detail_failures_are_non_fatal(self, logger_mock, requests_get_mock):
+        from azure.cli.command_modules.appservice.custom import _try_show_kudu_deployment_progress
+        progress_url = 'https://myapp.scm.azurewebsites.net/api/deployments/deploy-1/progress'
+        details_url = 'https://myapp.scm.azurewebsites.net/api/deployments/deploy-1/progress/1'
+        progress = {
+            'status': 'in_progress',
+            'total_steps': 1,
+            'steps': ['Building'],
+            'progress': [{
+                'step_number': 1,
+                'stage': 'Building',
+                'status': 'in_progress',
+                'started_at': '2026-10-06T08:00:00Z',
+                'completed_at': None,
+                'details_url': details_url,
+            }],
+        }
+        detail_failures = (
+            self._response(status_code=404),
+            self._response(json_error=ValueError('malformed')),
+            RuntimeError('request failed'),
+        )
+
+        for detail_failure in detail_failures:
+            with self.subTest(detail_failure=type(detail_failure).__name__):
+                requests_get_mock.reset_mock()
+                logger_mock.reset_mock()
+                requests_get_mock.side_effect = [
+                    self._response(payload=progress),
+                    detail_failure,
+                ]
+                params = self._params()
+
+                _try_show_kudu_deployment_progress(params.cmd, params, progress_url)
+
+                self.assertEqual(requests_get_mock.call_count, 2)
+                self.assertIn('[1/1] Building - In progress', self._rendered_warnings(logger_mock))
+
+
 class TestRuntimeFailedHintMocked(unittest.TestCase):
     """Tests that the TIP hint appears in RuntimeFailed and timeout errors."""
 
