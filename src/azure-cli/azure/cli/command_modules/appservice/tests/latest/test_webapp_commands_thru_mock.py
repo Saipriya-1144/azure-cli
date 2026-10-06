@@ -2262,10 +2262,10 @@ class TestKuduDeploymentProgressMocked(unittest.TestCase):
             [item['text'] for item in rendered],
             [
                 '\nDeployment progress',
-                '  ✓ [1/2] Validating (1s)',
+                '  ✓ [1/2] Validating',
                 '  ● [2/2] Building',
                 '      Restoring dependencies.',
-                '  ✓ [2/2] Building (9s)',
+                '  ✓ [2/2] Building',
                 '\nStarting application',
                 '  ● Starting site',
                 '  ✓ Site started successfully (0s)',
@@ -2483,12 +2483,12 @@ class TestKuduDeploymentProgressMocked(unittest.TestCase):
                 '  ✓ Kudu warmed up',
                 '  ✓ Deployment request accepted',
                 '\nDeployment progress',
-                '  ✓ [1/2] Validating (1s)',
+                '  ✓ [1/2] Validating',
                 '  ● [2/2] Building',
                 '      Restoring dependencies.',
                 '      Preparing build output.',
                 '      Writing the build manifest.',
-                '  ✓ [2/2] Building (1m 8s)',
+                '  ✓ [2/2] Building',
                 '\nStarting application',
                 '  ● Starting site',
                 '  ✓ Site started successfully (21s)',
@@ -2563,29 +2563,13 @@ class TestKuduDeploymentProgressMocked(unittest.TestCase):
                 '      Synced 100 files, 1 MB at 2 MB/s',
             ])
 
-    def test_duration_formatting_and_timestamp_failures(self):
-        from azure.cli.command_modules.appservice.custom import (
-            _format_onedeploy_duration,
-            _get_kudu_deployment_progress_elapsed,
-        )
+    def test_duration_formatting(self):
+        from azure.cli.command_modules.appservice.custom import _format_onedeploy_duration
 
         self.assertEqual(_format_onedeploy_duration(8), '8s')
         self.assertEqual(_format_onedeploy_duration(68), '1m 8s')
         self.assertEqual(_format_onedeploy_duration(3720), '1h 2m')
         self.assertIsNone(_format_onedeploy_duration(-1))
-        self.assertEqual(
-            _get_kudu_deployment_progress_elapsed({
-                'started_at': '2026-10-06T08:00:01Z',
-                'completed_at': '2026-10-06T08:01:09Z',
-            }),
-            '1m 8s')
-        for invalid_entry in (
-                {'started_at': None, 'completed_at': None},
-                {'started_at': 'not-a-date', 'completed_at': '2026-10-06T08:01:09Z'},
-                {'started_at': '2026-10-06T08:00:01', 'completed_at': '2026-10-06T08:01:09'},
-                {'started_at': '2026-10-06T08:01:09Z', 'completed_at': '2026-10-06T08:00:01Z'}):
-            with self.subTest(invalid_entry=invalid_entry):
-                self.assertIsNone(_get_kudu_deployment_progress_elapsed(invalid_entry))
 
     @mock.patch('azure.cli.command_modules.appservice.custom.print_styled_text')
     @mock.patch('requests.get')
@@ -2790,7 +2774,7 @@ class TestKuduDeploymentProgressMocked(unittest.TestCase):
             _KUDU_DEPLOYMENT_PROGRESS_REQUEST_TIMEOUT)
         self.assertEqual(
             [item['text'] for item in self._styled_output(print_styled_text_mock)],
-            ['\nDeployment progress', '  ✓ [1/1] Deploying (10s)'])
+            ['\nDeployment progress', '  ✓ [1/1] Deploying'])
 
     @mock.patch('azure.cli.command_modules.appservice.custom.print_styled_text')
     @mock.patch('azure.cli.command_modules.appservice.custom.time.sleep')

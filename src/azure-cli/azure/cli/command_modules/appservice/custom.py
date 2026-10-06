@@ -11276,12 +11276,10 @@ def _show_kudu_deployment_progress(progress_url, headers, state):  # pylint: dis
                 'failed': ('✗', Style.ERROR),
                 'canceled': ('✗', Style.ERROR),
             }[status]
-            elapsed = _get_kudu_deployment_progress_elapsed(entry)
-            elapsed_text = ' ({})'.format(elapsed) if elapsed else ''
             if _try_print_onedeploy_styled_text((
                     style,
-                    '  {} [{}/{}] {}{}'.format(
-                        marker, step_number, total_steps, stage, elapsed_text))):
+                    '  {} [{}/{}] {}'.format(
+                        marker, step_number, total_steps, stage))):
                 state['step_statuses'][step_key] = status
 
         if status == 'in_progress' and has_details:
@@ -11348,29 +11346,6 @@ def _get_kudu_deployment_progress_counter_family(message):
         if pattern.fullmatch(message):
             return family
     return None
-
-
-def _get_kudu_deployment_progress_elapsed(entry):
-    started_at = _parse_kudu_deployment_progress_timestamp(entry.get('started_at'))
-    completed_at = _parse_kudu_deployment_progress_timestamp(entry.get('completed_at'))
-    if started_at is None or completed_at is None or completed_at < started_at:
-        return None
-    return _format_onedeploy_duration((completed_at - started_at).total_seconds())
-
-
-def _parse_kudu_deployment_progress_timestamp(value):
-    if not isinstance(value, str) or not value.strip():
-        return None
-    value = value.strip()
-    if value.endswith('Z'):
-        value = value[:-1] + '+00:00'
-    try:
-        parsed = datetime.datetime.fromisoformat(value)
-    except ValueError:
-        return None
-    if parsed.tzinfo is None:
-        return None
-    return parsed.astimezone(datetime.timezone.utc)
 
 
 def _format_onedeploy_duration(total_seconds):
