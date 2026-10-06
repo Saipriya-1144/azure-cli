@@ -11168,11 +11168,9 @@ def _show_polished_onedeploy_preamble(deploy_params):
         (Style.HIGHLIGHT, 'Deploying {}'.format(package_name)),
         (Style.PRIMARY, '\n\n  App:             {}\n'
                         '  Resource group:  {}\n'
-                        '  Deployment type: {}\n'
                         '  Status tracking: Enabled'.format(
                             deploy_params.webapp_name,
-                            deploy_params.resource_group_name,
-                            deploy_params.artifact_type)),
+                            deploy_params.resource_group_name)),
         (Style.HIGHLIGHT, '\n\nPreparing deployment'),
     ])
     if rendered:

@@ -2476,7 +2476,6 @@ class TestKuduDeploymentProgressMocked(unittest.TestCase):
                 'Deploying node-oryx-small.zip\n\n'
                 '  App:             myApp\n'
                 '  Resource group:  myRG\n'
-                '  Deployment type: zip\n'
                 '  Status tracking: Enabled\n\n'
                 'Preparing deployment',
                 '  ● Warming up Kudu',
